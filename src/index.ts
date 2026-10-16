@@ -123,16 +123,28 @@ export default Plugin.define({
       if (validVariants.length === 0) return;
 
       const variant = (event.model as ModelRef).variant;
-      event.system.push({
-        type: "text",
-        text:
-          config.systemPrompt.trim() +
-          " " +
-          (variant ? `Current reasoning effort level: ${variant}. ` : "") +
-          `Valid reasoning effort levels for this session: ${validVariants.join(", ")}. ` +
-          `To change your reasoning effort, use the \`${config.toolName}\` tool with one of the valid levels. ` +
-          "Only call it when the task complexity justifies changing levels.",
-      });
+      const adaptivePrompt =
+        config.systemPrompt.trim() +
+        " " +
+        (variant ? `Current reasoning effort level: ${variant}. ` : "") +
+        `Valid reasoning effort levels for this session: ${validVariants.join(", ")}. ` +
+        `To change your reasoning effort, use the \`${config.toolName}\` tool with one of the valid levels. ` +
+        "Only call it when the task complexity justifies changing levels.";
+
+      // Some chat templates (e.g. strict Jinja templates used by local GGUF models) require
+      // exactly one system message at the very start and reject any later one. Merge the
+      // adaptive guidance into the existing first system part instead of pushing a second;
+      // only push a standalone entry when no system prompt exists yet.
+      const existing = event.system[0];
+      if (existing === undefined) {
+        event.system.push({ type: "text", text: adaptivePrompt });
+      } else {
+        event.system[0] = {
+          ...existing,
+          type: "text",
+          text: `${existing.text}\n\n${adaptivePrompt}`,
+        };
+      }
     });
 
     // On session idle, undo any temporary (non-persisted) reasoning-effort change.
