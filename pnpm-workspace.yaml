@@ -9,3 +9,9 @@ minimumReleaseAgeExclude:
   - "@typescript/native-preview-win32-arm64@7.0.0-dev.20260703.1"
   - "@typescript/native-preview-win32-x64@7.0.0-dev.20260703.1"
   - "@typescript/native-preview@7.0.0-dev.20260703.1"
+  - '@opencode/ai@2.0.32'
+  - '@opencode/client@2.0.32'
+  - '@opencode/plugin@2.0.32'
+  - '@opencode/protocol@2.0.32'
+  - '@opencode/schema@2.0.32'
+  - '@opencode/util@2.0.32'

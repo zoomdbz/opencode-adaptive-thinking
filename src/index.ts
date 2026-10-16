@@ -1,19 +1,16 @@
-import { tool, type Plugin } from "@opencode-ai/plugin";
-import type { Agent, Message, Model, Part, Provider } from "@opencode-ai/sdk/v2";
+import { Plugin } from "@opencode/plugin";
+import { Schema } from "effect";
 import { ConfigSchema } from "./config.js";
-import type { OpencodeClient } from "@opencode-ai/sdk";
 
-const z = tool.schema;
 const serviceName = "opencode-adaptive-thinking";
 const maxSessionStateSize = 500;
 
 type SessionState = {
-  currentVariant?: string;
   persistedVariant?: string;
   temporaryResetVariant?: string;
-  temporaryResetAgent?: string;
-  temporaryResetModel?: { providerID: string; modelID: string };
 };
+
+type ModelRef = { id: string; providerID: string; variant?: string };
 
 class SessionStateCache {
   private readonly entries = new Map<string, SessionState>();
@@ -24,6 +21,7 @@ class SessionStateCache {
     const entry = this.entries.get(sessionID);
     if (!entry) return;
 
+    // bump to most-recently-used
     this.entries.delete(sessionID);
     this.entries.set(sessionID, entry);
     return entry;
@@ -44,308 +42,125 @@ class SessionStateCache {
 
 const state = new SessionStateCache(maxSessionStateSize);
 
-type PromptAsyncOptions = Parameters<OpencodeClient["session"]["promptAsync"]>[0];
-type PromptAsyncBody = NonNullable<PromptAsyncOptions["body"]> & { variant: string };
-type ModelInfo = { providerID: string; modelID: string };
-
-export const AdaptiveThinkingPlugin: Plugin = async ({ client }, options) => {
-  const configParseResult = ConfigSchema.safeParse(options);
-  if (!configParseResult.success) {
-    const quiet =
-      typeof options === "object" && options !== null && "quiet" in options
-        ? options.quiet === true
-        : false;
-    if (!quiet) {
-      client.tui.showToast({
-        body: {
-          variant: "error",
-          message: "Invalid Adaptive Thinking plugin configuration, see logs for details",
-        },
-      });
+export default Plugin.define({
+  id: serviceName,
+  setup: async (ctx) => {
+    const configParseResult = ConfigSchema.safeParse(ctx.options);
+    if (!configParseResult.success) {
+      // v2 plugins have no logger or toast on the context; stderr is captured by opencode's logs.
+      console.error(`[${serviceName}] invalid configuration: ${configParseResult.error.message}`);
+      return;
     }
-    client.app.log({
-      body: {
-        service: serviceName,
-        level: "error",
-        message: `Invalid Adaptive Thinking plugin configuration: ${configParseResult.error.message}`,
-      },
-    });
-    return {};
-  }
 
-  const config = configParseResult.data;
-  if (!config.enabled) return {};
+    const config = configParseResult.data;
+    if (!config.enabled) return;
 
-  const getModelVariants = (model: Model | undefined): string[] => {
-    const variants = model?.variants;
-    if (!variants) return [];
-    return Object.keys(variants);
-  };
-
-  const sendVariantPrompt = async (
-    sessionID: string,
-    variant: string,
-    text: string,
-    agent: string,
-    model?: ModelInfo,
-    ignored = true,
-  ) => {
-    const body: PromptAsyncBody = {
-      noReply: true,
-      parts: [
-        {
-          type: "text",
-          text,
-          synthetic: true,
-          ignored,
-        },
-      ],
-      agent,
-      variant,
+    // Valid reasoning-effort levels are the variant ids of the session's active model.
+    const variantsForModel = async (model: ModelRef | undefined): Promise<string[]> => {
+      if (!model) return [];
+      const models = await ctx.model.list();
+      const info = models.data.find((m) => m.providerID === model.providerID && m.id === model.id);
+      return info?.variants?.map((v) => String(v.id)) ?? [];
     };
 
-    if (model) {
-      body.model = model;
-    }
+    const currentModel = async (sessionID: string): Promise<ModelRef | undefined> => {
+      const info = await ctx.session.get({ sessionID });
+      return info.model as ModelRef | undefined;
+    };
 
-    return client.session.promptAsync({
-      path: { id: sessionID },
-      body,
-    });
-  };
-
-  const resolveValidVariants = async (sessionID: string, model?: Model): Promise<string[]> => {
-    const inputModelVariants = getModelVariants(model);
-    if (inputModelVariants.length > 0) return inputModelVariants;
-
-    const messagesResponse = await client.session.messages({
-      path: { id: sessionID },
-    });
-    if (messagesResponse.error) {
-      client.app.log({
-        body: {
-          service: serviceName,
-          level: "error",
-          message: `Failed to retrieve messages for session ${sessionID}: ${JSON.stringify(messagesResponse.error.data)}`,
-        },
+    const setVariant = async (sessionID: string, model: ModelRef, variant: string) =>
+      ctx.session.switchModel({
+        sessionID,
+        model: { id: model.id, providerID: model.providerID, variant },
       });
-      return [];
-    }
-    const modelInfo = resolveLatestModelInfo(messagesResponse.data);
-    if (!modelInfo) return [];
 
-    const providers = await client.provider.list();
-    if (providers.error) {
-      client.app.log({
-        body: {
-          service: serviceName,
-          level: "error",
-          message: `Failed to retrieve providers for session ${sessionID}: ${JSON.stringify(providers.error)}`,
-        },
-      });
-      return [];
-    }
-    const provider = providers.data?.all.find((p) => p.id === modelInfo.providerID) as
-      | Provider
-      | undefined;
-    if (!provider) return [];
-
-    return getModelVariants(provider.models[modelInfo.modelID] as Model | undefined);
-  };
-
-  const resolveLatestModelInfo = (
-    data: unknown,
-  ): { providerID: string; modelID: string } | undefined => {
-    const messages = data as Array<{ info: Message; parts: Array<Part> }>;
-    for (let i = messages.length - 1; i >= 0; i--) {
-      const message = messages[i]!;
-      if ("model" in message.info) {
-        const { providerID, modelID } = message.info.model;
-        if (providerID && modelID) {
-          return { providerID, modelID };
-        }
-      }
-    }
-    return;
-  };
-
-  const resolveCurrentVariant = async (sessionID: string): Promise<string | undefined> => {
-    const messagesResponse = await client.session.messages({
-      path: { id: sessionID },
-    });
-    if (messagesResponse.error) {
-      client.app.log({
-        body: {
-          service: serviceName,
-          level: "error",
-          message: `Failed to retrieve messages for session ${sessionID}: ${JSON.stringify(messagesResponse.error.data)}`,
-        },
-      });
-      return;
-    }
-    let agentName: string | undefined;
-    const messages = messagesResponse.data as Array<{ info: Message; parts: Array<Part> }>;
-    for (let i = messages.length - 1; i >= 0; i--) {
-      const message = messages[i]!;
-      if ("model" in message.info && message.info.model.variant) {
-        return message.info.model.variant;
-      }
-      agentName ??= message.info.agent;
-    }
-
-    if (!agentName) return;
-
-    const agentsResponse = await client.app.agents();
-    if (agentsResponse.error) {
-      client.app.log({
-        body: {
-          service: serviceName,
-          level: "error",
-          message: `Failed to retrieve agents for session ${sessionID}: ${JSON.stringify(agentsResponse.error)}`,
-        },
-      });
-      return;
-    }
-    const agents = agentsResponse.data;
-    const agent = agents?.find((a) => a.name === agentName) as Agent | undefined;
-    return agent?.variant;
-  };
-
-  return {
-    tool: {
-      [config.toolName]: tool({
+    // Tool: let the agent set its own reasoning effort by switching the session's model variant.
+    await ctx.tool.transform((editor) => {
+      editor.add({
+        name: config.toolName,
         description: config.toolDescription,
-        args: {
-          level: z
-            .string()
-            .describe(
-              "The level of reasoning effort to apply. Higher levels may result in more accurate and thoughtful responses, but may also take more time and resources.",
-            ),
-          persist: z
-            .boolean()
-            .optional()
-            .default(false)
-            .describe(
-              "Whether to persist the setting for this session, otherwise it will only apply for the remainder of the current turn",
-            ),
-        },
-        execute: async ({ level, persist }, { sessionID, agent }) => {
-          const validVariants = await resolveValidVariants(sessionID);
-          if (validVariants.length === 0) {
-            return "Failed to set reasoning effort: no valid reasoning effort levels are available for this session";
+        input: Schema.Struct({
+          level: Schema.String,
+          persist: Schema.optional(Schema.Boolean),
+        }),
+        execute: async ({ level, persist }, { sessionID }) => {
+          const model = await currentModel(sessionID);
+          const validVariants = await variantsForModel(model);
+          if (!model || validVariants.length === 0) {
+            return {
+              content:
+                "Failed to set reasoning effort: no reasoning effort levels are available for this session.",
+            };
           }
           if (!validVariants.includes(level)) {
-            return `Invalid reasoning effort level: ${level}. Valid levels: ${validVariants.join(", ")}.`;
+            return {
+              content: `Invalid reasoning effort level: ${level}. Valid levels: ${validVariants.join(", ")}.`,
+            };
           }
 
-          const sessionState = state.get(sessionID);
-          const resetVariant = persist
-            ? undefined
-            : (sessionState?.persistedVariant ?? (await resolveCurrentVariant(sessionID)));
-          const currentModel = resolveLatestModelInfo(
-            (await client.session.messages({ path: { id: sessionID } })).data,
-          );
-
-          const promptResponse = await sendVariantPrompt(
-            sessionID,
-            level,
-            `Reasoning effort set to ${level}`,
-            agent,
-            currentModel,
-          );
-          if (promptResponse.error) {
-            return `Failed to set reasoning effort: ${JSON.stringify(promptResponse.error.data)}`;
-          }
+          const previousVariant = model.variant;
+          await setVariant(sessionID, model, level);
 
           state.update(sessionID, (entry) => {
-            entry.currentVariant = level;
             if (persist) {
               entry.persistedVariant = level;
               delete entry.temporaryResetVariant;
-              delete entry.temporaryResetAgent;
-              delete entry.temporaryResetModel;
-            } else if (resetVariant && resetVariant !== level) {
-              entry.temporaryResetVariant = resetVariant;
-              entry.temporaryResetAgent = agent;
-              if (currentModel) {
-                entry.temporaryResetModel = currentModel;
-              } else {
-                delete entry.temporaryResetModel;
-              }
+            } else if (previousVariant && previousVariant !== level) {
+              entry.temporaryResetVariant = previousVariant;
             } else {
               delete entry.temporaryResetVariant;
-              delete entry.temporaryResetAgent;
-              delete entry.temporaryResetModel;
             }
           });
 
-          return `Reasoning effort set to ${level}`;
+          return { content: `Reasoning effort set to ${level}.` };
         },
-      }),
-    },
-    event: async ({ event }) => {
-      if (event.type === "session.idle") {
-        const sessionID = event.properties.sessionID;
-        const sessionState = state.get(sessionID);
-        const resetVariant = sessionState?.temporaryResetVariant;
-        const resetAgent = sessionState?.temporaryResetAgent;
-        const resetModel = sessionState?.temporaryResetModel;
-        if (!resetVariant || !resetAgent) return;
+      });
+    });
 
-        const promptResponse = await sendVariantPrompt(
-          sessionID,
-          resetVariant,
-          `Reasoning effort reset to ${resetVariant}.`,
-          resetAgent,
-          resetModel,
-        );
-        if (promptResponse.error) {
-          client.app.log({
-            body: {
-              service: serviceName,
-              level: "error",
-              message: `Failed to reset reasoning effort on session idle: ${JSON.stringify(promptResponse.error.data)}`,
-            },
-          });
-          return;
-        }
+    // Inject guidance (and the live level list) into every model request's system prompt.
+    ctx.session.hook("context", async (event) => {
+      const validVariants = await variantsForModel(event.model as ModelRef);
+      if (validVariants.length === 0) return;
 
-        state.update(sessionID, (entry) => {
-          entry.currentVariant = resetVariant;
-          delete entry.temporaryResetVariant;
-          delete entry.temporaryResetAgent;
-          delete entry.temporaryResetModel;
-        });
-        return;
-      }
-    },
-    "experimental.chat.system.transform": async ({ sessionID, model }, { system }) => {
-      if (!sessionID) return;
-
-      const variants = await resolveValidVariants(sessionID, model as Model);
-      if (variants.length === 0) return;
-
-      const sessionState = state.get(sessionID);
-      const cachedVariant = sessionState?.currentVariant ?? sessionState?.persistedVariant;
-      let variant = cachedVariant && variants.includes(cachedVariant) ? cachedVariant : undefined;
-      if (!variant) {
-        const resolvedVariant = await resolveCurrentVariant(sessionID);
-        if (resolvedVariant && variants.includes(resolvedVariant)) {
-          variant = resolvedVariant;
-          state.update(sessionID, (entry) => {
-            entry.currentVariant = resolvedVariant;
-          });
-        }
-      }
-
-      system.push(
-        config.systemPrompt.trim() +
+      const variant = (event.model as ModelRef).variant;
+      event.system.push({
+        type: "text",
+        text:
+          config.systemPrompt.trim() +
           " " +
           (variant ? `Current reasoning effort level: ${variant}. ` : "") +
-          `Valid reasoning effort levels for this session: ${variants.join(", ")}. ` +
+          `Valid reasoning effort levels for this session: ${validVariants.join(", ")}. ` +
           `To change your reasoning effort, use the \`${config.toolName}\` tool with one of the valid levels. ` +
           "Only call it when the task complexity justifies changing levels.",
-      );
-    },
-  };
-};
+      });
+    });
+
+    // On session idle, undo any temporary (non-persisted) reasoning-effort change.
+    const abort = new AbortController();
+    void (async () => {
+      try {
+        for await (const ev of ctx.event.subscribe({ signal: abort.signal })) {
+          if (ev.type !== "session.idle") continue;
+
+          const sessionID = ev.data.sessionID;
+          const resetVariant = state.get(sessionID)?.temporaryResetVariant;
+          if (!resetVariant) continue;
+
+          const model = await currentModel(sessionID);
+          if (!model) continue;
+
+          await setVariant(sessionID, model, resetVariant);
+          state.update(sessionID, (entry) => {
+            delete entry.temporaryResetVariant;
+          });
+        }
+      } catch (err) {
+        if (!abort.signal.aborted) {
+          console.error(`[${serviceName}] event subscription error: ${String(err)}`);
+        }
+      }
+    })();
+
+    return () => abort.abort();
+  },
+});
